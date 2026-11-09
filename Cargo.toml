@@ -7,6 +7,7 @@ edition = "2024"
 async-stream = "0.3"
 axum = "0.8"
 clap = { version = "4", features = ["derive"] }
+dotenvy = "0.15.7"
 encoding_rs = "0.8"
 hf-hub = "1"
 llama-cpp-2 = { version = "0.1", features = ["sampler", "vulkan"] }

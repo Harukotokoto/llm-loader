@@ -1,19 +1,24 @@
 use std::convert::Infallible;
 
+use std::sync::Arc;
+
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Json, State};
 use axum::http::StatusCode;
-use axum::response::sse::{Event, Sse};
+use axum::middleware;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use tokio::sync::mpsc::Receiver;
-use utoipa::OpenApi;
+use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
+use utoipa::{Modify, OpenApi};
 use utoipa_swagger_ui::SwaggerUi;
 
+use super::auth;
 use super::openai::{self, FinishReason};
 use crate::inference::{
-    ChatTurn, Engine, EngineError, FailKind, FinishReason as ModelFinish, GenerateEvent, Prompt,
+    ChatTurn, Engine, EngineError, FailKind, FinishReason as ModelFinish, GenerateEvent,
+    GenerateStream, Prompt,
 };
 
 #[derive(Clone)]
@@ -29,6 +34,7 @@ pub struct AppState {
         version = env!("CARGO_PKG_VERSION"),
         description = "OpenAI-compatible API for one local GGUF model. The server loads a single model and ignores the request model name."
     ),
+    modifiers(&BearerAuth),
     paths(health, list_models, chat_completions, completions),
     components(schemas(
         openai::HealthBody,
@@ -36,6 +42,8 @@ pub struct AppState {
         openai::ModelCard,
         openai::ChatCompletionRequest,
         openai::ChatMessage,
+        openai::ChatTemplateKwargs,
+        openai::StreamOptions,
         openai::ChatCompletionResponse,
         openai::ChatChoice,
         openai::AssistantMessage,
@@ -50,15 +58,35 @@ pub struct AppState {
 )]
 struct ApiDoc;
 
-pub fn router(state: AppState) -> Router {
-    let api = Router::new()
-        .route("/health", get(health))
+/// Declares the bearer scheme used when an API key is configured.
+struct BearerAuth;
+
+impl Modify for BearerAuth {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        let components = openapi.components.get_or_insert_with(Default::default);
+        components.add_security_scheme(
+            "api_key",
+            SecurityScheme::Http(HttpBuilder::new().scheme(HttpAuthScheme::Bearer).build()),
+        );
+    }
+}
+
+/// `api_key` set: every `/v1` route requires it. `/health` and `/docs` stay open.
+pub fn router(state: AppState, api_key: Option<String>) -> Router {
+    let mut v1 = Router::new()
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
         .with_state(state);
+    if let Some(key) = api_key {
+        v1 = v1.layer(middleware::from_fn_with_state(
+            Arc::new(key),
+            auth::require_api_key,
+        ));
+    }
     Router::new()
-        .merge(api)
+        .route("/health", get(health))
+        .merge(v1)
         .merge(SwaggerUi::new("/docs").url("/openapi.json", ApiDoc::openapi()))
 }
 
@@ -76,6 +104,7 @@ async fn health() -> Json<openai::HealthBody> {
 #[utoipa::path(
     get,
     path = "/v1/models",
+    security(("api_key" = [])),
     responses((status = 200, description = "The loaded model.", body = openai::ModelList))
 )]
 async fn list_models(State(state): State<AppState>) -> Json<openai::ModelList> {
@@ -92,11 +121,13 @@ async fn list_models(State(state): State<AppState>) -> Json<openai::ModelList> {
 #[utoipa::path(
     post,
     path = "/v1/chat/completions",
+    security(("api_key" = [])),
     request_body = openai::ChatCompletionRequest,
     responses(
         (status = 200, description = "Generated assistant message. stream=true switches the body to server-sent events and ends with [DONE].", body = openai::ChatCompletionResponse),
         (status = 400, description = "The request cannot be run.", body = openai::ErrorResponse),
-        (status = 503, description = "Another request is already generating.", body = openai::ErrorResponse)
+        (status = 401, description = "The API key is missing or wrong.", body = openai::ErrorResponse),
+        (status = 503, description = "Another request is already generating. Retry later.", body = openai::ErrorResponse)
     )
 )]
 async fn chat_completions(
@@ -122,8 +153,13 @@ async fn chat_completions(
         Ok(prepared) => prepared,
         Err(message) => return invalid(message),
     };
-    let prompt = Prompt::Chat(
-        request
+    let enable_thinking = request
+        .chat_template_kwargs
+        .and_then(|kwargs| kwargs.enable_thinking)
+        .unwrap_or(true);
+    let include_usage = wants_usage(request.stream_options);
+    let prompt = Prompt::Chat {
+        turns: request
             .messages
             .into_iter()
             .map(|message| ChatTurn {
@@ -131,12 +167,14 @@ async fn chat_completions(
                 content: message.content,
             })
             .collect(),
-    );
+        enable_thinking,
+    };
     let id = openai::new_id("chatcmpl");
     dispatch(
         state,
         prompt,
         prepared,
+        include_usage,
         id,
         "chat.completion",
         StreamShape::Chat,
@@ -147,11 +185,13 @@ async fn chat_completions(
 #[utoipa::path(
     post,
     path = "/v1/completions",
+    security(("api_key" = [])),
     request_body = openai::CompletionRequest,
     responses(
         (status = 200, description = "Generated text. stream=true switches the body to server-sent events and ends with [DONE].", body = openai::CompletionResponse),
         (status = 400, description = "The request cannot be run.", body = openai::ErrorResponse),
-        (status = 503, description = "Another request is already generating.", body = openai::ErrorResponse)
+        (status = 401, description = "The API key is missing or wrong.", body = openai::ErrorResponse),
+        (status = 503, description = "Another request is already generating. Retry later.", body = openai::ErrorResponse)
     )
 )]
 async fn completions(
@@ -178,10 +218,12 @@ async fn completions(
         Err(message) => return invalid(message),
     };
     let id = openai::new_id("cmpl");
+    let include_usage = wants_usage(request.stream_options);
     dispatch(
         state,
         Prompt::Text(request.prompt),
         prepared,
+        include_usage,
         id,
         "text_completion",
         StreamShape::Text,
@@ -195,8 +237,15 @@ enum StreamShape {
     Text,
 }
 
+fn wants_usage(options: Option<openai::StreamOptions>) -> bool {
+    options
+        .and_then(|options| options.include_usage)
+        .unwrap_or(false)
+}
+
 struct Collected {
     text: String,
+    reasoning: String,
     finish: FinishReason,
     prompt_tokens: u32,
     completion_tokens: u32,
@@ -206,6 +255,7 @@ async fn dispatch(
     state: AppState,
     prompt: Prompt,
     prepared: openai::Prepared,
+    include_usage: bool,
     id: String,
     object: &'static str,
     shape: StreamShape,
@@ -217,7 +267,7 @@ async fn dispatch(
     let created = openai::created_at();
     let model = state.model_id;
     if prepared.stream {
-        return stream_response(events, id, created, model, shape);
+        return stream_response(events, id, created, model, shape, include_usage);
     }
     match collect(&mut events).await {
         Ok(collected) => json_completion(id, object, created, model, shape, collected),
@@ -225,10 +275,12 @@ async fn dispatch(
     }
 }
 
-async fn collect(events: &mut Receiver<GenerateEvent>) -> Result<Collected, Response> {
+async fn collect(events: &mut GenerateStream) -> Result<Collected, Response> {
     let mut text = String::new();
+    let mut reasoning = String::new();
     while let Some(event) = events.recv().await {
         match event {
+            GenerateEvent::Reasoning(piece) => reasoning.push_str(&piece),
             GenerateEvent::Delta(piece) => text.push_str(&piece),
             GenerateEvent::Finished {
                 finish,
@@ -237,6 +289,7 @@ async fn collect(events: &mut Receiver<GenerateEvent>) -> Result<Collected, Resp
             } => {
                 return Ok(Collected {
                     text,
+                    reasoning,
                     finish: wire_finish(finish),
                     prompt_tokens,
                     completion_tokens,
@@ -271,6 +324,8 @@ fn json_completion(
                 message: openai::AssistantMessage {
                     role: "assistant".into(),
                     content: collected.text,
+                    reasoning_content: (!collected.reasoning.is_empty())
+                        .then_some(collected.reasoning),
                 },
                 finish_reason: collected.finish,
             }],
@@ -293,32 +348,44 @@ fn json_completion(
 }
 
 fn stream_response(
-    mut events: Receiver<GenerateEvent>,
+    mut events: GenerateStream,
     id: String,
     created: i64,
     model: String,
     shape: StreamShape,
+    include_usage: bool,
 ) -> Response {
     let stream = async_stream::stream! {
         let mut started = false;
         while let Some(event) = events.recv().await {
             match event {
-                GenerateEvent::Delta(text) => {
-                    let data = chunk_json(&id, created, &model, shape, Some(text), started, None);
+                GenerateEvent::Reasoning(text) => {
+                    let delta = Delta::Reasoning(text);
+                    let data = chunk_json(&id, created, &model, shape, delta, started, None);
                     started = true;
                     yield Ok::<Event, Infallible>(Event::default().data(data));
                 }
-                GenerateEvent::Finished { finish, .. } => {
+                GenerateEvent::Delta(text) => {
+                    let delta = Delta::Content(text);
+                    let data = chunk_json(&id, created, &model, shape, delta, started, None);
+                    started = true;
+                    yield Ok(Event::default().data(data));
+                }
+                GenerateEvent::Finished { finish, prompt_tokens, completion_tokens } => {
                     let data = chunk_json(
                         &id,
                         created,
                         &model,
                         shape,
-                        None,
+                        Delta::Empty,
                         started,
                         Some(wire_finish(finish)),
                     );
                     yield Ok(Event::default().data(data));
+                    if include_usage {
+                        let data = usage_chunk_json(&id, created, &model, shape, prompt_tokens, completion_tokens);
+                        yield Ok(Event::default().data(data));
+                    }
                     yield Ok(Event::default().data("[DONE]"));
                     break;
                 }
@@ -339,7 +406,16 @@ fn stream_response(
             }
         }
     };
-    Sse::new(stream).into_response()
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+/// What one streamed chunk carries.
+enum Delta {
+    Reasoning(String),
+    Content(String),
+    Empty,
 }
 
 fn chunk_json(
@@ -347,13 +423,25 @@ fn chunk_json(
     created: i64,
     model: &str,
     shape: StreamShape,
-    text: Option<String>,
+    delta: Delta,
     started: bool,
     finish: Option<FinishReason>,
 ) -> String {
     let payload = match shape {
         StreamShape::Chat => {
-            let role = (!started).then(|| "assistant".to_string());
+            let mut body = serde_json::Map::new();
+            if !started {
+                body.insert("role".into(), "assistant".into());
+            }
+            match delta {
+                Delta::Reasoning(text) => {
+                    body.insert("reasoning_content".into(), text.into());
+                }
+                Delta::Content(text) => {
+                    body.insert("content".into(), text.into());
+                }
+                Delta::Empty => {}
+            }
             serde_json::json!({
                 "id": id,
                 "object": "chat.completion.chunk",
@@ -361,10 +449,7 @@ fn chunk_json(
                 "model": model,
                 "choices": [{
                     "index": 0,
-                    "delta": {
-                        "role": role,
-                        "content": text,
-                    },
+                    "delta": body,
                     "finish_reason": finish,
                 }],
             })
@@ -376,11 +461,38 @@ fn chunk_json(
             "model": model,
             "choices": [{
                 "index": 0,
-                "text": text.unwrap_or_default(),
+                "text": match delta {
+                    Delta::Content(text) => text,
+                    _ => String::new(),
+                },
                 "finish_reason": finish,
             }],
         }),
     };
+    serde_json::to_string(&payload).unwrap_or_else(|_| "{}".into())
+}
+
+/// Last chunk before `[DONE]` when the client asked for usage. It has no choices.
+fn usage_chunk_json(
+    id: &str,
+    created: i64,
+    model: &str,
+    shape: StreamShape,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+) -> String {
+    let object = match shape {
+        StreamShape::Chat => "chat.completion.chunk",
+        StreamShape::Text => "text_completion",
+    };
+    let payload = serde_json::json!({
+        "id": id,
+        "object": object,
+        "created": created,
+        "model": model,
+        "choices": [],
+        "usage": openai::usage(prompt_tokens, completion_tokens),
+    });
     serde_json::to_string(&payload).unwrap_or_else(|_| "{}".into())
 }
 

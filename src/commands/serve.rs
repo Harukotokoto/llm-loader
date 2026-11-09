@@ -49,7 +49,14 @@ pub async fn run(request: Request) -> Result<(), ExitError> {
 
     eprintln!("model: {}", loaded.path.display());
     eprintln!("device: {}", loaded.device);
-    server::listen(engine, loaded.id, request.host, request.port).await
+    server::listen(
+        engine,
+        loaded.id,
+        request.host,
+        request.port,
+        server::load_api_key(),
+    )
+    .await
 }
 
 fn resolve_model(

@@ -41,8 +41,22 @@ pub struct ChatCompletionRequest {
     #[schema(value_type = Vec<String>)]
     pub stop: Option<Vec<String>>,
     pub stream: Option<bool>,
+    pub stream_options: Option<StreamOptions>,
     pub seed: Option<u32>,
     pub n: Option<u32>,
+    /// Template options. `enable_thinking` (default true) lets a thinking model reason first.
+    pub chat_template_kwargs: Option<ChatTemplateKwargs>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ChatTemplateKwargs {
+    pub enable_thinking: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct StreamOptions {
+    /// Send a final chunk with token usage before `[DONE]`.
+    pub include_usage: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -72,6 +86,9 @@ pub struct ChatChoice {
 pub struct AssistantMessage {
     pub role: String,
     pub content: String,
+    /// The model's `<think>` text, when it produced any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -88,6 +105,7 @@ pub struct CompletionRequest {
     #[schema(value_type = Vec<String>)]
     pub stop: Option<Vec<String>>,
     pub stream: Option<bool>,
+    pub stream_options: Option<StreamOptions>,
     pub seed: Option<u32>,
     pub n: Option<u32>,
 }

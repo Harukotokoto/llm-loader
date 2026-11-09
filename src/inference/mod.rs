@@ -1,8 +1,11 @@
 mod generate;
 mod llama;
 mod stop;
+mod think;
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::thread;
 
@@ -19,7 +22,11 @@ pub struct ChatTurn {
 /// What the caller wants the model to continue.
 #[derive(Debug)]
 pub enum Prompt {
-    Chat(Vec<ChatTurn>),
+    Chat {
+        turns: Vec<ChatTurn>,
+        /// Lets a thinking model reason before it answers.
+        enable_thinking: bool,
+    },
     Text(String),
 }
 
@@ -40,6 +47,9 @@ pub enum FinishReason {
 
 #[derive(Debug)]
 pub enum GenerateEvent {
+    /// Text inside `<think>`. Only chat prompts produce it.
+    Reasoning(String),
+    /// Answer text.
     Delta(String),
     Finished {
         finish: FinishReason,
@@ -96,25 +106,67 @@ struct Job {
     events: tokio::sync::mpsc::Sender<GenerateEvent>,
 }
 
+/// Marks the model as taken. Releasing it lets the next request start.
+struct BusyPermit(Arc<AtomicBool>);
+
+impl Drop for BusyPermit {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Events of one generation. The model stays reserved until the last event is read
+/// or this value is dropped.
+pub struct GenerateStream {
+    receiver: tokio::sync::mpsc::Receiver<GenerateEvent>,
+    permit: Option<BusyPermit>,
+}
+
+impl GenerateStream {
+    pub async fn recv(&mut self) -> Option<GenerateEvent> {
+        let event = self.receiver.recv().await;
+        if matches!(
+            event,
+            None | Some(GenerateEvent::Finished { .. } | GenerateEvent::Failed { .. })
+        ) {
+            self.permit = None;
+        }
+        event
+    }
+}
+
 /// Handle to the single inference thread. One generation runs at a time.
 #[derive(Clone)]
 pub struct Engine {
     jobs: SyncSender<Job>,
+    busy: Arc<AtomicBool>,
 }
 
 impl Engine {
+    /// Start a generation, or fail with [`EngineError::Busy`] while another one is running.
     pub fn generate(
         &self,
         prompt: Prompt,
         params: GenerateParams,
-    ) -> Result<tokio::sync::mpsc::Receiver<GenerateEvent>, EngineError> {
+    ) -> Result<GenerateStream, EngineError> {
+        if self
+            .busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(EngineError::Busy);
+        }
+        let permit = BusyPermit(self.busy.clone());
         let (events, receiver) = tokio::sync::mpsc::channel(32);
         match self.jobs.try_send(Job {
             prompt,
             params,
             events,
         }) {
-            Ok(()) => Ok(receiver),
+            Ok(()) => Ok(GenerateStream {
+                receiver,
+                permit: Some(permit),
+            }),
             Err(TrySendError::Full(_)) => Err(EngineError::Busy),
             Err(TrySendError::Disconnected(_)) => Err(EngineError::Stopped),
         }
@@ -143,5 +195,11 @@ pub fn start(options: LoadOptions) -> Result<(Engine, LoadedModel), LoadError> {
     let loaded = ready_rx.recv().map_err(|_| {
         LoadError::Message("inference thread stopped before the model loaded".into())
     })??;
-    Ok((Engine { jobs: jobs_tx }, loaded))
+    Ok((
+        Engine {
+            jobs: jobs_tx,
+            busy: Arc::new(AtomicBool::new(false)),
+        },
+        loaded,
+    ))
 }
