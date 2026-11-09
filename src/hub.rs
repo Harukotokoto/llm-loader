@@ -71,7 +71,11 @@ pub async fn download(request: DownloadRequest) -> Result<PathBuf, HubError> {
         return Err(HubError::Usage("revision must not be empty".into()));
     }
     let (owner, name) = parse_repo(&request.repo)?;
+    // Files fetched with `local_dir` lose the Xet hash after the CDN redirect and
+    // fall back to one plain HTTP stream that cannot resume. The cache path keeps
+    // Xet downloads, so fetch there and link the result into the models directory.
     let client = HFClient::builder()
+        .cache_dir(paths::hub_cache_dir(&request.dir))
         .build()
         .map_err(|err| HubError::Download(err.to_string()))?;
     let repo = client.model(owner.clone(), name.clone());
@@ -97,22 +101,18 @@ pub async fn download(request: DownloadRequest) -> Result<PathBuf, HubError> {
         }
     };
 
-    let dest_dir = request.dir.join(&owner).join(&name);
-    let dest = dest_dir.join(&filename);
-    let path = if dest.is_file() && file_size(&dest)? > 0 {
-        eprintln!("already downloaded");
-        dest
-    } else {
-        eprintln!("downloading {owner}/{name} {filename}");
-        repo.download_file()
-            .filename(filename.clone())
-            .local_dir(dest_dir)
-            .revision(request.revision.clone())
-            .progress(Progress::new(StderrProgress))
-            .send()
-            .await
-            .map_err(|err| HubError::Download(err.to_string()))?
-    };
+    eprintln!("downloading {owner}/{name} {filename}");
+    let cached = repo
+        .download_file()
+        .filename(filename.clone())
+        .revision(request.revision.clone())
+        .progress(Progress::new(StderrProgress))
+        .send()
+        .await
+        .map_err(|err| HubError::Download(err.to_string()))?;
+
+    let dest = request.dir.join(&owner).join(&name).join(&filename);
+    let path = place_file(&cached, &dest)?;
     let path = fs_canonicalize(&path);
     paths::write_current(
         &request.dir,
@@ -212,6 +212,30 @@ fn list_files(names: &[&str]) -> String {
         body.push('\n');
     }
     body
+}
+
+/// Make `dest` the same file as the finished download.
+///
+/// A hard link keeps a single copy on disk. A leftover file of another size,
+/// such as an interrupted earlier download, is replaced.
+fn place_file(source: &Path, dest: &Path) -> Result<PathBuf, HubError> {
+    let source = fs_canonicalize(source);
+    if dest.is_file() {
+        if paths::same_file(&source, dest) || file_size(dest)? == file_size(&source)? {
+            return Ok(dest.to_path_buf());
+        }
+        std::fs::remove_file(dest)
+            .map_err(|err| HubError::Download(format!("remove {}: {err}", dest.display())))?;
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| HubError::Download(format!("create {}: {err}", parent.display())))?;
+    }
+    if std::fs::hard_link(&source, dest).is_err() {
+        std::fs::copy(&source, dest)
+            .map_err(|err| HubError::Download(format!("copy to {}: {err}", dest.display())))?;
+    }
+    Ok(dest.to_path_buf())
 }
 
 fn file_size(path: &Path) -> Result<u64, HubError> {

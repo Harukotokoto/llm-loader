@@ -23,6 +23,12 @@ pub fn models_dir(flag: Option<&Path>) -> PathBuf {
     }
 }
 
+/// Hugging Face cache used while downloading. Kept inside the models directory
+/// so a finished file can be hard-linked instead of copied.
+pub fn hub_cache_dir(dir: &Path) -> PathBuf {
+    dir.join(".hf-cache")
+}
+
 pub fn current_path(dir: &Path) -> PathBuf {
     dir.join("current.json")
 }
@@ -84,6 +90,9 @@ fn collect_gguf(dir: &Path, found: &mut Vec<PathBuf>) -> Result<(), String> {
     for entry in entries {
         let entry = entry.map_err(|err| format!("read {}: {err}", dir.display()))?;
         let path = entry.path();
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
         if path.is_dir() {
             collect_gguf(&path, found)?;
             continue;
