@@ -1,6 +1,7 @@
 use std::convert::Infallible;
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
@@ -14,8 +15,8 @@ use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi};
 use utoipa_swagger_ui::SwaggerUi;
 
-use super::auth;
 use super::openai::{self, FinishReason};
+use super::{auth, log};
 use crate::inference::{
     ChatTurn, Engine, EngineError, FailKind, FinishReason as ModelFinish, GenerateEvent,
     GenerateStream, Prompt,
@@ -84,6 +85,8 @@ pub fn router(state: AppState, api_key: Option<String>) -> Router {
             auth::require_api_key,
         ));
     }
+    // Added last so rejected requests are logged too.
+    let v1 = v1.layer(middleware::from_fn(log::log_request));
     Router::new()
         .route("/health", get(health))
         .merge(v1)
@@ -260,18 +263,62 @@ async fn dispatch(
     object: &'static str,
     shape: StreamShape,
 ) -> Response {
+    let summary = describe_prompt(&prompt);
+    tracing::info!(
+        %id,
+        %summary,
+        stream = prepared.stream,
+        max_tokens = prepared.params.max_tokens,
+        temperature = prepared.params.temperature,
+        top_p = prepared.params.top_p,
+        "generation requested"
+    );
     let mut events = match state.engine.generate(prompt, prepared.params) {
         Ok(events) => events,
-        Err(err) => return engine_error(err),
+        Err(err) => {
+            tracing::warn!(%id, error = %err, "generation rejected");
+            return engine_error(err);
+        }
     };
     let created = openai::created_at();
     let model = state.model_id;
+    let started = Instant::now();
     if prepared.stream {
-        return stream_response(events, id, created, model, shape, include_usage);
+        return stream_response(events, id, created, model, shape, include_usage, started);
     }
     match collect(&mut events).await {
-        Ok(collected) => json_completion(id, object, created, model, shape, collected),
-        Err(response) => response,
+        Ok(collected) => {
+            tracing::info!(
+                %id,
+                prompt_tokens = collected.prompt_tokens,
+                completion_tokens = collected.completion_tokens,
+                finish = ?collected.finish,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "generation finished"
+            );
+            json_completion(id, object, created, model, shape, collected)
+        }
+        Err(response) => {
+            tracing::warn!(%id, status = response.status().as_u16(), "generation failed");
+            response
+        }
+    }
+}
+
+/// Size of the prompt for the log. The text itself is not logged.
+fn describe_prompt(prompt: &Prompt) -> String {
+    match prompt {
+        Prompt::Chat {
+            turns,
+            enable_thinking,
+        } => {
+            let chars: usize = turns.iter().map(|turn| turn.content.chars().count()).sum();
+            format!(
+                "chat messages={} chars={chars} thinking={enable_thinking}",
+                turns.len()
+            )
+        }
+        Prompt::Text(text) => format!("text chars={}", text.chars().count()),
     }
 }
 
@@ -354,6 +401,7 @@ fn stream_response(
     model: String,
     shape: StreamShape,
     include_usage: bool,
+    started_at: Instant,
 ) -> Response {
     let stream = async_stream::stream! {
         let mut started = false;
@@ -372,6 +420,14 @@ fn stream_response(
                     yield Ok(Event::default().data(data));
                 }
                 GenerateEvent::Finished { finish, prompt_tokens, completion_tokens } => {
+                    tracing::info!(
+                        %id,
+                        prompt_tokens,
+                        completion_tokens,
+                        finish = ?finish,
+                        elapsed_ms = started_at.elapsed().as_millis() as u64,
+                        "generation finished"
+                    );
                     let data = chunk_json(
                         &id,
                         created,
@@ -390,6 +446,7 @@ fn stream_response(
                     break;
                 }
                 GenerateEvent::Failed { message, kind } => {
+                    tracing::warn!(%id, error = %message, "generation failed");
                     let body = openai::ErrorResponse {
                         error: openai::ApiErrorBody {
                             message,

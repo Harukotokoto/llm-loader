@@ -1,4 +1,5 @@
 mod auth;
+mod log;
 mod openai;
 mod routes;
 
@@ -31,12 +32,15 @@ pub async fn listen(
     eprintln!("api key: {auth_state}");
 
     let app = routes::router(routes::AppState { engine, model_id }, api_key);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-            eprintln!("shutting down");
-        })
-        .await
-        .map_err(|err| ExitError::usage(format!("http server stopped: {err}")))?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async {
+        let _ = tokio::signal::ctrl_c().await;
+        eprintln!("shutting down");
+    })
+    .await
+    .map_err(|err| ExitError::usage(format!("http server stopped: {err}")))?;
     Ok(())
 }

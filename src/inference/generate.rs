@@ -212,8 +212,14 @@ impl Output {
     }
 }
 
+/// Decode bytes that may end inside a multi-byte character.
+///
+/// `decode_to_string` never grows the string, so the capacity is reserved first.
 fn decode_piece(decoder: &mut Decoder, bytes: &[u8], last: bool) -> String {
-    let mut piece = String::new();
+    let capacity = decoder
+        .max_utf8_buffer_length(bytes.len())
+        .unwrap_or(bytes.len() * 3 + 4);
+    let mut piece = String::with_capacity(capacity);
     let _ = decoder.decode_to_string(bytes, &mut piece, last);
     piece
 }
@@ -296,5 +302,22 @@ fn render(
             let reasoning_open = text.trim_end().ends_with(THINK_OPEN);
             Ok((text, Some(ThinkSplitter::new(reasoning_open))))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_pieces_split_inside_a_character() {
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        let bytes = "こんにちは".as_bytes();
+        let (head, tail) = bytes.split_at(4);
+        let mut text = decode_piece(&mut decoder, b"Hi ", false);
+        text.push_str(&decode_piece(&mut decoder, head, false));
+        text.push_str(&decode_piece(&mut decoder, tail, false));
+        text.push_str(&decode_piece(&mut decoder, &[], true));
+        assert_eq!(text, "Hi こんにちは");
     }
 }
